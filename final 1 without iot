@@ -1,0 +1,291 @@
+#include <Wire.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+#include <Adafruit_GFX.h>    // Core graphics library
+#include <Adafruit_ST7735.h> // Hardware-specific library for ST7735
+#include <SPI.h>
+
+// --- TFT Display Pins ---
+#define TFT_CS     5
+#define TFT_RST    4
+#define TFT_DC     2
+
+Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
+
+// ==========================================
+// --- CUSTOM HIGH-END COLOR PALETTE ---
+// (Colors must be in 16-bit RGB565 format for ST7735)
+// ==========================================
+#define CLR_BACKGROUND 0x18E3 // Deep Slate Gray
+#define CLR_PANEL      0x2945 // Lighter Slate for boxes
+#define CLR_TEXT_LABEL 0xBDF7 // Silver/Gray for titles
+#define CLR_TEMP       0x055F // Bright Sky Blue
+#define CLR_BPM        0x069A // Mint Green
+#define CLR_HEART      0xF800 // Bright Red
+#define CLR_WARN       0xFD20 // Amber/Yellow
+#define CLR_WAIT       0x7BEF // Soft Gray-Blue
+
+// --- MAX30205 Temperature Sensor Variables ---
+#define MAX30205_ADDRESS 0x48
+#define TEMP_REGISTER 0x00
+
+// --- MAX30102 Heart Rate Sensor Variables ---
+MAX30105 particleSensor;
+const long FINGER_THRESHOLD = 50000;
+
+// --- State Tracking Variables ---
+bool isMeasuring = false;
+bool fingerPresent = false;
+unsigned long measurementStartTime = 0;
+long lastBeat = 0;
+float bpmSum = 0;
+int bpmCount = 0;
+
+// Track current UI state to prevent screen flickering
+int currentUIState = -1; 
+float lastTemp = -999.0;
+int lastBPM = -1;
+
+void setup() {
+  Serial.begin(115200);
+
+  // 1. Initialize Display
+  tft.initR(INITR_BLACKTAB);
+  tft.setRotation(1); // Landscape (160x128)
+  tft.fillScreen(CLR_BACKGROUND);
+
+  // 2. Initialize Sensors
+  Wire.begin(21, 22);
+  
+  Wire.beginTransmission(MAX30205_ADDRESS);
+  if (Wire.endTransmission() != 0) {
+    drawStatusBar("TEMP SENSOR ERROR", CLR_HEART, CLR_BACKGROUND);
+    while (1);
+  }
+
+  if (!particleSensor.begin(Wire, I2C_SPEED_STANDARD)) { // Kept Standard to prevent NACKs
+    drawStatusBar("HR SENSOR ERROR", CLR_HEART, CLR_BACKGROUND);
+    while (1);
+  }
+  
+  particleSensor.setup();
+  particleSensor.setPulseAmplitudeRed(0x0A);
+  particleSensor.setPulseAmplitudeGreen(0);
+
+  // 3. Draw the initial user interface
+  drawStaticUI();
+  updateStatusBar(0); // State 0 = Waiting
+
+  measurementStartTime = millis();
+}
+
+void loop() {
+  long irValue = particleSensor.getIR();
+
+  // --- FINGER OFF SENSOR ---
+  if (irValue < FINGER_THRESHOLD) {
+    if (fingerPresent) {
+      fingerPresent = false;
+      isMeasuring = false;
+      updateStatusBar(0); // Show "Waiting for finger"
+      displayBPM(0);      // Clear BPM value
+    }
+
+    // Still update temperature every 1s
+    if (millis() - measurementStartTime >= 1000) {
+      displayTemperature(readTemperature());
+      measurementStartTime = millis();
+    }
+    delay(10);
+  }
+
+  // --- FINGER ON SENSOR ---
+  else {
+    if (!fingerPresent) {
+      fingerPresent = true;
+      isMeasuring = true;
+      updateStatusBar(1); // Show "Measuring..."
+      
+      measurementStartTime = millis();
+      bpmSum = 0;
+      bpmCount = 0;
+      lastBeat = millis();
+    }
+
+    if (isMeasuring) {
+      // Check for heartbeat
+      if (checkForBeat(irValue) == true) {
+        long delta = millis() - lastBeat;
+        lastBeat = millis();
+        float beatsPerMinute = 60 / (delta / 1000.0);
+        
+        if (beatsPerMinute < 255 && beatsPerMinute > 20) {
+          bpmSum += beatsPerMinute;
+          bpmCount++;
+          
+          // Small animation: Briefly flash the heart graphic
+          drawHeartIcon(CLR_BACKGROUND); // Erase
+          delay(20);
+          drawHeartIcon(CLR_HEART);      // Redraw
+        }
+      }
+
+      // 1-second update cycle
+      if (millis() - measurementStartTime >= 1000) {
+        displayTemperature(readTemperature());
+
+        if (bpmCount > 0) {
+          float averageBPM = bpmSum / bpmCount;
+          if (averageBPM >= 55) {
+            displayBPM((int)averageBPM);
+            updateStatusBar(2); // Show "Stable"
+          } else {
+            updateStatusBar(1); // Still calculating
+          }
+        }
+
+        measurementStartTime = millis();
+        bpmSum = 0;
+        bpmCount = 0;
+      }
+    }
+  }
+}
+
+// ==========================================
+// --- GRAPHICS & UI FUNCTIONS ---
+// ==========================================
+
+void drawStaticUI() {
+  tft.fillScreen(CLR_BACKGROUND);
+
+  // Draw Two Main Panels (Left for Temp, Right for HR)
+  // Left Panel: x=4, y=4, w=74, h=94
+  tft.fillRoundRect(4, 4, 74, 94, 4, CLR_PANEL);
+  
+  // Right Panel: x=82, y=4, w=74, h=94
+  tft.fillRoundRect(82, 4, 74, 94, 4, CLR_PANEL);
+
+  // Draw Labels
+  tft.setTextColor(CLR_TEXT_LABEL);
+  tft.setTextSize(1);
+  
+  tft.setCursor(24, 12);
+  tft.print("TEMP");
+  
+  tft.setCursor(108, 12);
+  tft.print("BPM");
+
+  // Draw Icons
+  drawThermometerIcon();
+  drawHeartIcon(CLR_HEART);
+}
+
+void drawThermometerIcon() {
+  // Simple thermometer drawn with primitive shapes
+  tft.fillCircle(15, 20, 3, CLR_TEMP);
+  tft.fillRect(14, 12, 3, 8, CLR_TEMP);
+  tft.drawCircle(15, 20, 5, CLR_TEXT_LABEL);
+  tft.drawFastVLine(12, 10, 8, CLR_TEXT_LABEL);
+  tft.drawFastVLine(18, 10, 8, CLR_TEXT_LABEL);
+  tft.drawFastHLine(13, 10, 5, CLR_TEXT_LABEL);
+}
+
+void drawHeartIcon(uint16_t color) {
+  // Simple heart drawn with overlapping circles and a triangle
+  tft.fillCircle(95, 16, 4, color);
+  tft.fillCircle(103, 16, 4, color);
+  tft.fillTriangle(91, 17, 107, 17, 99, 25, color);
+}
+
+void displayTemperature(float tempC) {
+  // Only redraw if the value changes to prevent flickering
+  if (abs(tempC - lastTemp) > 0.05) {
+    tft.setTextSize(2);
+    tft.setTextColor(CLR_TEMP, CLR_PANEL); // Background color prevents text overlapping
+    
+    // Position text dynamically
+    tft.setCursor(12, 45);
+    tft.print(tempC, 1);
+    
+    // Draw degree symbol and C
+    tft.setTextSize(1);
+    tft.setCursor(62, 45);
+    tft.print("C");
+    tft.drawCircle(60, 45, 1, CLR_TEMP); // Degree symbol
+    
+    lastTemp = tempC;
+  }
+}
+
+void displayBPM(int bpm) {
+  if (bpm != lastBPM) {
+    tft.setTextSize(3);
+    
+    // Clear the specific text area to avoid artifacts
+    tft.fillRect(92, 40, 55, 25, CLR_PANEL);
+    
+    if (bpm == 0) {
+      tft.setTextColor(CLR_WAIT);
+      tft.setCursor(105, 42);
+      tft.print("--");
+    } else {
+      tft.setTextColor(CLR_BPM);
+      // Center the text slightly depending on if it's 2 or 3 digits
+      if (bpm < 100) tft.setCursor(105, 42);
+      else tft.setCursor(95, 42);
+      tft.print(bpm);
+    }
+    
+    lastBPM = bpm;
+  }
+}
+
+// State 0: Waiting, State 1: Measuring, State 2: Stable
+void updateStatusBar(int state) {
+  if (currentUIState != state) {
+    if (state == 0) {
+      drawStatusBar("WAITING FOR FINGER", CLR_WAIT, CLR_BACKGROUND);
+    } 
+    else if (state == 1) {
+      drawStatusBar("MEASURING HR...", CLR_WARN, CLR_BACKGROUND);
+    } 
+    else if (state == 2) {
+      drawStatusBar("READING STABLE", CLR_BPM, CLR_BACKGROUND);
+    }
+    currentUIState = state;
+  }
+}
+
+void drawStatusBar(const char* text, uint16_t bgColor, uint16_t textColor) {
+  // Footer Box: x=4, y=102, w=152, h=22
+  tft.fillRoundRect(4, 102, 152, 22, 4, bgColor);
+  
+  tft.setTextColor(textColor);
+  tft.setTextSize(1);
+  
+  // Roughly center the text
+  int cursorX = 80 - (strlen(text) * 3);
+  tft.setCursor(cursorX, 109);
+  tft.print(text);
+}
+
+// ==========================================
+// --- LOW-LEVEL SENSOR FUNCTIONS ---
+// ==========================================
+
+float readTemperature() {
+  Wire.beginTransmission(MAX30205_ADDRESS);
+  Wire.write(TEMP_REGISTER);
+  Wire.endTransmission();
+  Wire.requestFrom(MAX30205_ADDRESS, 2);
+  
+  if (Wire.available() == 2) {
+    uint8_t msb = Wire.read();
+    uint8_t lsb = Wire.read();
+    uint16_t rawTemp = (msb << 8) | lsb;
+    rawTemp = rawTemp & 0x3FFF;
+    return rawTemp * 0.00390625;
+  }
+  return 0.0;
+}
