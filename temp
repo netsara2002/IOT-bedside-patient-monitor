@@ -1,0 +1,64 @@
+#include <Wire.h>
+
+// Default I2C address for MAX30205 (when A0, A1, A2 are disconnected or grounded)
+#define MAX30205_ADDRESS 0x48 
+#define TEMP_REGISTER 0x00
+
+void setup() {
+  // Start the Serial Monitor at 115200 baud
+  Serial.begin(115200);
+  
+  // Initialize I2C on ESP32 default pins (SDA = GPIO 21, SCL = GPIO 22)
+  Wire.begin(21, 22); 
+
+  Serial.println("Initializing MAX30205...");
+  
+  // Basic check to see if the sensor is detected on the I2C bus
+  Wire.beginTransmission(MAX30205_ADDRESS);
+  if (Wire.endTransmission() == 0) {
+    Serial.println("MAX30205 successfully found!");
+  } else {
+    Serial.println("MAX30205 NOT found. Please check your wiring.");
+  }
+}
+
+void loop() {
+  float temperatureC = readTemperature();
+  float temperatureF = (temperatureC * 9.0 / 5.0) + 32.0;
+  
+  Serial.print("Body Temperature: ");
+  Serial.print(temperatureC, 2);
+  Serial.print(" °C  |  ");
+  Serial.print(temperatureF, 2);
+  Serial.println(" °F");
+  
+  delay(1000); // Wait 1 second before taking the next reading
+}
+
+// Function to request and calculate the temperature
+float readTemperature() {
+  // Point to the temperature register
+  Wire.beginTransmission(MAX30205_ADDRESS);
+  Wire.write(TEMP_REGISTER);
+  Wire.endTransmission();
+
+  // Request 2 bytes of data from the sensor
+  Wire.requestFrom(MAX30205_ADDRESS, 2); 
+
+  if (Wire.available() == 2) {
+    uint8_t msb = Wire.read();
+    uint8_t lsb = Wire.read();
+    
+    // Combine the two bytes into an UNSIGNED 16-bit integer
+    uint16_t rawTemp = (msb << 8) | lsb;
+    
+    // THE FIX: Clear the top two buggy bits using a bitwise AND mask
+    // This removes the fake negative sign caused by the hardware bug
+    rawTemp = rawTemp & 0x3FFF; 
+    
+    // Convert raw data to Celsius (MAX30205 resolution is 0.00390625 °C per LSB)
+    return rawTemp * 0.00390625; 
+  }
+  
+  return 0.0; // Return 0.0 if the read fails
+}
