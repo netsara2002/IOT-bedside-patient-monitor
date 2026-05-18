@@ -1,0 +1,101 @@
+#include <Wire.h>
+#include "MAX30105.h" 
+#include "heartRate.h"
+
+MAX30105 particleSensor;
+
+// --- State Variables ---
+bool isMeasuring = false;
+bool fingerPresent = false;
+unsigned long measurementStartTime = 0;
+
+// --- BPM Variables ---
+long lastBeat = 0;
+float bpmSum = 0;
+int bpmCount = 0;
+
+// IR value threshold for finger detection 
+const long FINGER_THRESHOLD = 50000; 
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Initializing MAX30102...");
+
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30102 was not found. Please check wiring and power.");
+    while (1); 
+  }
+
+  particleSensor.setup(); 
+  particleSensor.setPulseAmplitudeRed(0x0A); 
+  particleSensor.setPulseAmplitudeGreen(0); 
+  
+  Serial.println("Waiting for finger...");
+}
+
+void loop() {
+  long irValue = particleSensor.getIR();
+
+  // Check if the finger is OFF the sensor
+  if (irValue < FINGER_THRESHOLD) {
+    if (fingerPresent) {
+      Serial.println("--- Finger removed. Waiting for finger... ---");
+      fingerPresent = false;
+      isMeasuring = false;
+    }
+    delay(10); 
+  } 
+  
+  // Check if the finger is ON the sensor
+  else {
+    if (!fingerPresent) {
+      Serial.println("Finger detected! Starting measurement...");
+      fingerPresent = true;
+      isMeasuring = true;
+      
+      measurementStartTime = millis();
+      bpmSum = 0;
+      bpmCount = 0;
+      lastBeat = millis(); 
+    }
+
+    if (isMeasuring) {
+      // Check for a heartbeat
+      if (checkForBeat(irValue) == true) {
+        long delta = millis() - lastBeat;
+        lastBeat = millis();
+
+        float beatsPerMinute = 60 / (delta / 1000.0);
+
+        if (beatsPerMinute < 255 && beatsPerMinute > 20) {
+          bpmSum += beatsPerMinute;
+          bpmCount++;
+        }
+      }
+
+      // Check if 1 second (1000 milliseconds) has passed
+      if (millis() - measurementStartTime >= 1000) {
+        if (bpmCount > 0) {
+          float averageBPM = bpmSum / bpmCount;
+          
+          // Only display the value if the average is 55 or higher
+          if (averageBPM >= 55) {
+            Serial.print(">>> BPM: ");
+            Serial.println(averageBPM);
+          } else {
+            // Value is lower than 55
+            Serial.println("Calculating...");
+          }
+        } else {
+           // No beats detected in that 1 second window
+           Serial.println("Calculating...");
+        }
+
+        // Reset variables to start the next 1-second cycle immediately
+        measurementStartTime = millis();
+        bpmSum = 0;
+        bpmCount = 0;
+      }
+    }
+  }
+}
