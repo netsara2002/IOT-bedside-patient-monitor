@@ -1,0 +1,192 @@
+#include <Wire.h>
+#include "MAX30105.h" // Works for MAX30102
+#include <vector>
+
+// Sensor and Threshold settings
+const uint32_t MIN_SIGNAL = 50000; // Scaled up slightly for the C++ library output range
+const int HEART_RATE_LOW = 50;
+const int HEART_RATE_HIGH = 120;
+
+// Pin Definitions (Matches your ESP32 wiring)
+const int RED_LED = 25;
+const int GREEN_LED = 26;
+const int BUZZER = 27;
+
+MAX30105 sensor;
+
+// Buffers and State Variables
+uint32_t prev_ir = 0;
+bool is_rising = false;
+std::vector<unsigned long> ir_timestamps;
+
+std::vector<uint32_t> red_buffer;
+std::vector<uint32_t> ir_buffer;
+
+bool in_alert_state = false;
+unsigned long last_serial_print = 0;
+
+// --- Math Functions Translated from MicroPython ---
+
+int calculate_heart_rate() {
+  int beats = ir_timestamps.size();
+  if (beats < 2) return 0;
+  
+  unsigned long duration_ms = ir_timestamps.back() - ir_timestamps.front();
+  if (duration_ms > 0) {
+    float heart_rate = ((float)beats / duration_ms) * 60000.0;
+    return (int)heart_rate;
+  }
+  return 0;
+}
+
+int calculate_spo2() {
+  int size = red_buffer.size();
+  if (size < 10 || ir_buffer.size() < 10) return -1; // -1 represents 'None'
+
+  float mean_red = 0, mean_ir = 0;
+  for (int i = 0; i < size; i++) {
+    mean_red += red_buffer[i];
+    mean_ir += ir_buffer[i];
+  }
+  mean_red /= size;
+  mean_ir /= size;
+
+  float ac_red = 0, ac_ir = 0;
+  for (int i = 0; i < size; i++) {
+    ac_red += abs((float)red_buffer[i] - mean_red);
+    ac_ir += abs((float)ir_buffer[i] - mean_ir);
+  }
+  ac_red /= size;
+  ac_ir /= size;
+
+  if (ac_ir == 0) return -1;
+  
+  float ratio = (ac_red / mean_red) / (ac_ir / mean_ir);
+  float spo2 = 110.0 - 25.0 * ratio;
+  
+  if (spo2 < 0 || spo2 > 100) return -1;
+  return (int)spo2;
+}
+
+// --- Setup and Loop ---
+
+void setup() {
+  Serial.begin(115200);
+  
+  pinMode(RED_LED, OUTPUT);
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+
+  Serial.println("Initializing...");
+
+  // Initialize I2C on standard ESP32 pins (SDA=21, SCL=22)
+  if (!sensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30102 Error! Sensor not detected.");
+    while (1); // Halt if sensor not found
+  }
+
+  // Configure sensor settings to match your Python setup
+  byte ledBrightness = 0x2F; // Active LEDs amplitude
+  byte sampleAverage = 4;    // FIFO average
+  byte ledMode = 2;          // Red + IR
+  int sampleRate = 200;      // Sample rate
+  int pulseWidth = 411;
+  int adcRange = 4096;
+  
+  sensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
+
+  Serial.println("MAX30102 Ready. Waiting for finger...");
+}
+
+void loop() {
+  // Check the sensor for new data
+  sensor.check();
+  
+  while (sensor.available()) {
+    // Read oldest data in the FIFO buffer
+    uint32_t red = sensor.getFIFORed();
+    uint32_t ir = sensor.getFIFOIR();
+    sensor.nextSample(); // Move to next sample
+
+    if (ir < MIN_SIGNAL) {
+      // No finger detected
+      if (millis() - last_serial_print > 1000) {
+        Serial.println("Place finger on the sensor...");
+        last_serial_print = millis();
+      }
+      
+      digitalWrite(RED_LED, HIGH);
+      digitalWrite(GREEN_LED, LOW);
+      digitalWrite(BUZZER, HIGH);
+      delay(200);
+      digitalWrite(BUZZER, LOW);
+      
+      // Clear buffers
+      ir_timestamps.clear();
+      red_buffer.clear();
+      ir_buffer.clear();
+      prev_ir = 0;
+      is_rising = false;
+      in_alert_state = false;
+      
+    } else {
+      // Finger detected, process data
+      uint32_t current_ir = ir;
+      
+      if (current_ir > prev_ir) {
+        is_rising = true;
+      } else if (is_rising && current_ir < prev_ir) {
+        ir_timestamps.push_back(millis());
+        if (ir_timestamps.size() > 10) {
+          ir_timestamps.erase(ir_timestamps.begin());
+        }
+        is_rising = false;
+      }
+      prev_ir = current_ir;
+
+      red_buffer.push_back(red);
+      ir_buffer.push_back(ir);
+      
+      // Maintain buffer size of 50
+      if (red_buffer.size() > 50) red_buffer.erase(red_buffer.begin());
+      if (ir_buffer.size() > 50) ir_buffer.erase(ir_buffer.begin());
+
+      int heart_rate = calculate_heart_rate();
+      int spo2 = calculate_spo2();
+
+      // Output to Serial Monitor (Updates twice a second to keep it readable)
+      if (millis() - last_serial_print > 500) {
+        if (spo2 != -1) {
+          Serial.print("Pulse: "); Serial.print(heart_rate);
+          Serial.print(" bpm | SpO2: "); Serial.print(spo2); Serial.println("%");
+        } else {
+          Serial.print("Pulse: "); Serial.print(heart_rate);
+          Serial.println(" bpm | SpO2: Calculating...");
+        }
+        last_serial_print = millis();
+      }
+
+      // LED and Buzzer Alarm Logic
+      if (heart_rate >= HEART_RATE_LOW && heart_rate <= HEART_RATE_HIGH) {
+        digitalWrite(BUZZER, LOW);
+        digitalWrite(GREEN_LED, HIGH);
+        digitalWrite(RED_LED, LOW);
+        in_alert_state = false;
+      } else {
+        digitalWrite(GREEN_LED, LOW);
+        digitalWrite(RED_LED, HIGH);
+        
+        digitalWrite(BUZZER, HIGH);
+        delay(200);
+        digitalWrite(BUZZER, LOW);
+        
+        if (!in_alert_state) {
+          digitalWrite(BUZZER, HIGH);
+          delay(200);
+          digitalWrite(BUZZER, LOW);
+          in_alert_state = true;
+        }
+      }
+    }
+  }
+}
